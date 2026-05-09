@@ -1,5 +1,124 @@
 # @nicia-ai/typegraph
 
+## 0.25.0
+
+### Minor Changes
+
+0.25.0 is the runtime schema evolution release. It adds graph extensions,
+unified index declarations and materialization, dynamic queries over
+runtime-declared kinds, runtime access to compiled props schemas, and a safer
+transactional schema-version commit path.
+
+#### Highlights
+
+- Graph extensions let applications commit reviewed JSON schema proposals as
+  durable TypeGraph schema versions without redeploying application code.
+- Compile-time, graph-extension, relational, and vector indexes now share one
+  canonical declaration channel and flow through `Store.materializeIndexes()`.
+- Dynamic query builder methods let typed queries traverse runtime-declared node
+  and edge kinds while still validating kind names, endpoints, and field
+  predicates at query-build time.
+- `Store` now exposes compiled Zod props schemas for compile-time and
+  graph-extension kinds through `getNodePropsSchema`, `getEdgePropsSchema`, and
+  their `OrThrow` variants.
+- Node and edge definitions now accept JSON-serializable `annotations` for
+  consumer-owned metadata such as UI hints, audit policy, and provenance.
+
+#### New APIs
+
+- `defineGraphExtension(input)` and `validateGraphExtension(input, options?)`.
+- `Store.evolve`, `Store.deprecateKinds`, `Store.undeprecateKinds`,
+  `Store.removeKinds`, `Store.materializeRemovals`, and dynamic collection
+  accessors for graph-extension kinds.
+- `defineGraph({ indexes })`, `defineNodeIndex`, `defineEdgeIndex`, `andWhere`,
+  `orWhere`, `notWhere`, and the `@nicia-ai/typegraph/indexes` subpath for
+  advanced index tooling.
+- `Store.materializeIndexes(options?)` plus `MaterializeIndexesResult` status
+  reporting.
+- `embedding(dimensions, options?)` vector index options and exported vector
+  index declaration/configuration types.
+- `fromDynamic`, `traverseDynamic`, `optionalTraverseDynamic`, and `toDynamic`
+  on the query builder.
+- `SchemaValidationResult.initialized` and `.migrated` now include
+  `committedRow: SchemaVersionRow`.
+- `SqlTableNames` now includes `uniques` so cleanup paths can honor custom
+  physical table names.
+
+#### Performance and reliability
+
+- Schema commits now use a transactional `commitSchemaVersion` backend primitive
+  instead of the old insert-then-activate sequence, fixing the orphan schema-row
+  crash window.
+- `materializeIndexes` bulk-loads materialization status in one round trip and
+  records per-index drift/failure state in `typegraph_index_materializations`.
+- `materializeRemovals` records a reconciliation watermark, honors custom table
+  names, and cleans secondary embedding/fulltext/unique rows for removed node
+  kinds.
+- Schema hash and parsed-schema caches avoid repeated serialization, SHA-256,
+  and Zod parse work on no-change startup and repeated store creation.
+- Graph-extension merge/compile paths share caches and fast paths for idempotent
+  or partially overlapping evolves.
+- Postgres vector-index drops now run per-metric DDL concurrently.
+
+#### Breaking changes for backend implementers
+
+These changes affect custom `GraphBackend` implementations and advanced index
+consumers; ordinary `createStoreWithSchema`, query, and collection callers
+should not need code changes.
+
+- `insertSchema` and `setActiveSchema` were removed from `GraphBackend`.
+  Implement `commitSchemaVersion` and `setActiveVersion` instead.
+- `commitSchemaVersion` and `setActiveVersion` require transactional behavior.
+  Non-transactional drivers such as Cloudflare D1, Durable Objects,
+  `drizzle-orm/neon-http`, and SQLite backends configured with
+  `transactionMode: "none"` refuse these primitives for schema commits.
+- `createFulltextIndex` and `dropFulltextIndex` were removed from
+  `GraphBackend`; fulltext storage remains owned by the active backend fulltext
+  strategy.
+- The old `NodeIndex`, `EdgeIndex`, and `TypeGraphIndex` types were removed from
+  `@nicia-ai/typegraph/indexes`. Use `NodeIndexDeclaration`,
+  `EdgeIndexDeclaration`, or `IndexDeclaration`.
+- Custom backends should add the new optional materialization/removal primitives
+  when they want first-class support for index status loading, removal
+  reconciliation markers, and vector index materialization.
+
+#### Upgrade notes
+
+- Existing deployments with manually managed schemas should add the one-active
+  schema-version partial unique index:
+  `typegraph_schema_versions_one_active_per_graph_idx` on `(graph_id)` where
+  `is_active` is true (`TRUE` on Postgres, `1` on SQLite).
+- Manually managed schemas should also sync the generated DDL for the new
+  TypeGraph status tables, including `typegraph_index_materializations`,
+  `typegraph_kind_removals`, and `typegraph_reconciliation_markers`.
+- Run schema migrations from a transactional backend. Edge or HTTP-only
+  non-transactional drivers can continue serving normal reads and writes after
+  the schema is established.
+- Tests that deep-compare the full `SchemaValidationResult` object may need to
+  switch to partial matching because `initialized` and `migrated` now include
+  `committedRow`.
+
+#### Pull requests
+
+- [#103](https://github.com/nicia-ai/typegraph/pull/103) - Add per-kind
+  `annotations`.
+- [#106](https://github.com/nicia-ai/typegraph/pull/106) - Add atomic schema
+  version commits.
+- [#107](https://github.com/nicia-ai/typegraph/pull/107) - Add compile-time
+  index declarations to graph definitions and serialized schemas.
+- [#112](https://github.com/nicia-ai/typegraph/pull/112) - Add
+  `Store.materializeIndexes`.
+- [#117](https://github.com/nicia-ai/typegraph/pull/117) - Unify vector indexes
+  with the index declaration channel.
+- [#118](https://github.com/nicia-ai/typegraph/pull/118) - Add graph
+  extensions.
+- [#125](https://github.com/nicia-ai/typegraph/pull/125) - Add dynamic query
+  traversal methods.
+- [#126](https://github.com/nicia-ai/typegraph/pull/126) - Expose runtime Zod
+  props schemas.
+- [#127](https://github.com/nicia-ai/typegraph/pull/127) - Pre-release cleanup
+  and performance pass.
+
 ## 0.24.1
 
 ### Patch Changes
