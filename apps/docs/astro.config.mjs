@@ -83,6 +83,10 @@ const sidebar = [
     label: "Examples",
     items: [
       {
+        label: "Agent-Driven Schema",
+        slug: "examples/agent-driven-schema",
+      },
+      {
         label: "Research Copilot",
         slug: "examples/research-copilot",
       },
@@ -123,6 +127,10 @@ const sidebar = [
   {
     label: "Ejecting",
     slug: "ejecting",
+  },
+  {
+    label: "Changelog",
+    slug: "changelog",
   },
 ];
 
