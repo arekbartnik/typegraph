@@ -8,6 +8,9 @@ on:
       - "package.json"
       - "pnpm-lock.yaml"
       - "pnpm-workspace.yaml"
+      # The /changelog page is generated from this file by sync-changelog.mjs,
+      # so release ("Version Packages") commits must re-trigger the docs build.
+      - "packages/typegraph/CHANGELOG.md"
   workflow_dispatch:
 
 concurrency:
