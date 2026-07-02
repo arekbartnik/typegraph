@@ -22,6 +22,10 @@ import {
   type ValueType,
   type VectorSimilarityPredicate,
 } from "../ast";
+import {
+  LIKE_ESCAPE_CHARACTER,
+  likeEscapeClause,
+} from "../dialect/like-escape";
 import { type DialectAdapter } from "../dialect/types";
 import { type VectorStrategy } from "../dialect/vector-strategy";
 import {
@@ -321,9 +325,17 @@ function convertValueForSql(value: unknown, dialect: DialectAdapter): unknown {
  * Compiles a string pattern for LIKE operations.
  */
 function compileStringPattern(op: string, pattern: string): string {
+  // Escape the escape character first so the wildcards we prefix below aren't
+  // double-escaped, then neutralize the LIKE wildcards. Mirrors
+  // escapeLikePatternParameter for the parameterized path. The emitted
+  // LIKE/ILIKE declares this same character as its ESCAPE (see likeEscapeClause).
   const escaped = pattern
-    .replaceAll("%", String.raw`\%`)
-    .replaceAll("_", String.raw`\_`);
+    .replaceAll(
+      LIKE_ESCAPE_CHARACTER,
+      `${LIKE_ESCAPE_CHARACTER}${LIKE_ESCAPE_CHARACTER}`,
+    )
+    .replaceAll("%", `${LIKE_ESCAPE_CHARACTER}%`)
+    .replaceAll("_", `${LIKE_ESCAPE_CHARACTER}_`);
 
   switch (op) {
     case "contains": {
@@ -455,7 +467,7 @@ export function compilePredicateExpression(
         ) {
           return dialect.ilike(field, pattern);
         }
-        return sql`${field} LIKE ${pattern}`;
+        return sql`${field} LIKE ${pattern} ${likeEscapeClause}`;
       }
 
       const pattern = compileStringPattern(expr.op, expr.pattern);
@@ -470,8 +482,11 @@ export function compilePredicateExpression(
       ) {
         return dialect.ilike(field, pattern);
       }
-      // Use case-sensitive LIKE only for explicit 'like' operator
-      return sql`${field} LIKE ${pattern}`;
+      // Use case-sensitive LIKE only for explicit 'like' operator. The ESCAPE
+      // clause must match the parameterized path (above) and dialect.ilike so a
+      // raw '\%' / '\_' in a user pattern is a literal on SQLite too, not just
+      // on Postgres (whose default LIKE escape is already backslash).
+      return sql`${field} LIKE ${pattern} ${likeEscapeClause}`;
     }
 
     case "null_check": {
