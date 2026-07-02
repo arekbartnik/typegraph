@@ -24,8 +24,12 @@
  * Concurrent-write enumeration is a P1 concern.
  */
 
-import { canonicalizeProps, parseRowProps } from "./canonical-props";
-import { compareStrings } from "./node-key";
+import {
+  canonicalizeProps,
+  edgeStateSignature,
+  parseRowProps,
+} from "./canonical-props";
+import { compareStrings, type MergeKey, mergeKey } from "./node-key";
 import type {
   EdgeId,
   GraphBackend,
@@ -152,6 +156,23 @@ export type StateDiff = Readonly<{
     modified: readonly ModifiedEdge[];
     deleted: readonly DeletedEdge[];
   }>;
+  /**
+   * `(kind, id) -> version` for every fork-store node observed during this diff
+   * (live and soft-deleted). Captured from the same enumeration the diff reads,
+   * so it is the fork's exact observed state — the incremental merge uses the
+   * target branch's map as the plan-time baseline for its commit-time
+   * lost-update guard (see assertInheritedTargetUnchanged in merge.ts).
+   */
+  forkNodeVersions: ReadonlyMap<MergeKey, number>;
+  /**
+   * `(kind, id) -> {@link edgeStateSignature}` for every fork-store edge observed
+   * during this diff (live and soft-deleted). The edge-half analogue of
+   * {@link forkNodeVersions}: edges carry no `version` column, so the guard
+   * fingerprints their mergeable content (endpoints, liveness, canonical props)
+   * instead. The incremental merge uses the target branch's map as the plan-time
+   * baseline for the commit-time lost-update guard.
+   */
+  forkEdgeSignatures: ReadonlyMap<MergeKey, string>;
 }>;
 
 /**
@@ -395,6 +416,9 @@ export async function diffAgainstBase<G extends GraphDef>(
   const newNodes: ChangedNode[] = [];
   const modifiedNodes: ModifiedNode[] = [];
   const deletedNodes: DeletedNode[] = [];
+  // Version snapshot of the fork store as observed by THIS diff's enumeration
+  // (the same read the plan resolves against), keyed by merge identity.
+  const forkNodeVersions = new Map<MergeKey, number>();
 
   for (const kind of nodeKinds) {
     const baseRows = await enumerateAllNodes(
@@ -407,6 +431,9 @@ export async function diffAgainstBase<G extends GraphDef>(
       forkStore.graphId,
       kind,
     );
+    for (const row of forkRows) {
+      forkNodeVersions.set(mergeKey(kind, row.id), row.version);
+    }
     const delta = diffNodeKind(kind, baseRows, forkRows);
     for (const entry of delta.new) {
       newNodes.push(entry);
@@ -422,6 +449,10 @@ export async function diffAgainstBase<G extends GraphDef>(
   const newEdges: ChangedEdge[] = [];
   const modifiedEdges: ModifiedEdge[] = [];
   const deletedEdges: DeletedEdge[] = [];
+  // Content fingerprint of the fork store's edges as observed by THIS diff's
+  // enumeration — the edge-half baseline for the commit-time lost-update guard
+  // (edges have no version, so we key on mergeable content instead).
+  const forkEdgeSignatures = new Map<MergeKey, string>();
 
   for (const kind of edgeKinds) {
     const baseRows = await enumerateAllEdges(
@@ -434,6 +465,19 @@ export async function diffAgainstBase<G extends GraphDef>(
       forkStore.graphId,
       kind,
     );
+    for (const row of forkRows) {
+      forkEdgeSignatures.set(
+        mergeKey(kind, row.id),
+        edgeStateSignature({
+          fromKind: row.from_kind,
+          fromId: row.from_id,
+          toKind: row.to_kind,
+          toId: row.to_id,
+          live: isLive(row),
+          props: parseRowProps(row.props),
+        }),
+      );
+    }
     const delta = diffEdgeKind(kind, baseRows, forkRows);
     for (const entry of delta.new) {
       newEdges.push(entry);
@@ -457,5 +501,7 @@ export async function diffAgainstBase<G extends GraphDef>(
       modified: modifiedEdges.sort((left, right) => byId(left, right)),
       deleted: deletedEdges.sort((left, right) => byId(left, right)),
     },
+    forkNodeVersions,
+    forkEdgeSignatures,
   };
 }

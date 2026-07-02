@@ -47,7 +47,7 @@ import {
   contentComponentOf,
 } from "./base-version";
 import { blockNodes } from "./blocking";
-import { canonicalizeProps } from "./canonical-props";
+import { canonicalizeProps, edgeStateSignature } from "./canonical-props";
 import type { CanonicalEntity, ClusterMember } from "./canonicalize";
 import { BASE_PROVENANCE_BRANCH, canonicalizeCluster } from "./canonicalize";
 import { buildSubClassClosure } from "./closures";
@@ -1528,8 +1528,15 @@ async function resolveMerge<G extends GraphDef>(
   }
 
   try {
-    // (2) stage the provenance-tagged union of every branch's diff.
-    const staging = await stageBranches(store, branches);
+    // (2) stage the provenance-tagged union of every branch's diff. For the
+    // incremental path, capture the committed target branch's node versions from
+    // its diff enumeration — the plan-time baseline for the commit-time
+    // lost-update guard (assertInheritedTargetUnchanged).
+    const staging = await stageBranches(
+      store,
+      branches,
+      incremental?.targetBranchId,
+    );
 
     // Capture the stable branch order ONCE (never wall-clock).
     const preferredBranchId = incremental?.targetBranchId;
@@ -1615,6 +1622,8 @@ async function resolveMerge<G extends GraphDef>(
           plannedBaseMatchKeys: new Set(
             candidates.data.baseMembers.map((member) => mergeKeyOf(member)),
           ),
+          targetNodeVersions: staging.targetNodeVersions,
+          targetEdgeSignatures: staging.targetEdgeSignatures,
         });
 
     // (10) assemble the report. The full provenance records are always built in the
@@ -2269,6 +2278,22 @@ type IncrementalCommitGuard<G extends GraphDef> = Readonly<{
   options: NormalizedMergeOptions<G>;
   introspectionKinds: ReadonlyMap<string, readonly UniqueIntrospection[]>;
   plannedBaseMatchKeys: ReadonlySet<MergeKey>;
+  /**
+   * `(kind, id) -> version` for every committed target node observed while
+   * planning (the target-branch diff enumeration). The commit-time guard
+   * re-reads the rows the plan writes OR deletes and refuses if any inherited
+   * row's version advanced in the plan→commit window — a concurrent write the
+   * stale plan would otherwise overwrite (lost update).
+   */
+  targetNodeVersions: ReadonlyMap<MergeKey, number>;
+  /**
+   * `(kind, id) -> content signature` for every committed target edge observed
+   * while planning. The edge-half analogue of {@link targetNodeVersions}: edges
+   * have no version, so the guard fingerprints their mergeable content
+   * (endpoints, liveness, canonical props) and refuses if the fingerprint of an
+   * edge the plan upserts OR deletes drifted in the plan→commit window.
+   */
+  targetEdgeSignatures: ReadonlyMap<MergeKey, string>;
 }>;
 
 /**
@@ -2374,6 +2399,170 @@ async function assertBaseResolutionStable<G extends GraphDef>(
   );
 }
 
+/** A `(kind, id)` the plan will mutate whose identity was an observed target row. */
+type InheritedTargetRef = Readonly<{ kind: string; id: string }>;
+
+/**
+ * Buckets the plan's inherited-target mutations by kind, deduped by identity, for
+ * a single batched re-read per kind. `identities` filters to the rows observed at
+ * plan time (new rows the plan creates have no baseline and are skipped). Both a
+ * write and a delete of the same identity collapse to one entry — either way the
+ * row is re-checked once.
+ */
+function bucketInheritedRefsByKind(
+  refs: Iterable<InheritedTargetRef>,
+  identities: ReadonlySet<MergeKey>,
+): ReadonlyMap<string, readonly string[]> {
+  const seen = new Set<MergeKey>();
+  const idsByKind = new Map<string, string[]>();
+  for (const ref of refs) {
+    const identity = mergeKey(ref.kind, ref.id);
+    if (!identities.has(identity) || seen.has(identity)) {
+      continue;
+    }
+    seen.add(identity);
+    const bucket = idsByKind.get(ref.kind) ?? [];
+    bucket.push(ref.id);
+    idsByKind.set(ref.kind, bucket);
+  }
+  return idsByKind;
+}
+
+/**
+ * The inherited-target-row half of the incremental TOCTOU guard. The plan folds
+ * the live target in as a preferred branch and resolves inherited modifications
+ * against the target rows it enumerated OUTSIDE this transaction. If a committed
+ * row the plan mutates was changed in the plan→commit window, applying the plan
+ * would discard that write (a silent lost update) — the per-row write guards only
+ * check resurrection / lossy strips, not that the row still holds the value the
+ * plan merged from.
+ *
+ * Covers every path that mutates a committed target row: node writes and node
+ * deletions (checked by `version`), and edge upserts and edge deletions (checked
+ * by content signature, since edges carry no version). For each, it re-reads the
+ * committed row through the tx snapshot and refuses if it drifted (or vanished).
+ * SERIALIZABLE + retry then re-plans against the now-committed value, exactly as
+ * the snapshot path's {@link assertTargetUnchanged} does for full-graph drift.
+ */
+async function assertInheritedTargetUnchanged<G extends GraphDef>(
+  nodesApi: TxNodes,
+  edgesApi: TxEdges,
+  guard: IncrementalCommitGuard<G>,
+  plan: MergePlan<G>,
+): Promise<void> {
+  await assertInheritedNodesUnchanged(nodesApi, guard, plan);
+  await assertInheritedEdgesUnchanged(edgesApi, guard, plan);
+}
+
+/** Version-checks every committed target node the plan writes or deletes. */
+async function assertInheritedNodesUnchanged<G extends GraphDef>(
+  nodesApi: TxNodes,
+  guard: IncrementalCommitGuard<G>,
+  plan: MergePlan<G>,
+): Promise<void> {
+  const { targetNodeVersions } = guard;
+  if (targetNodeVersions.size === 0) {
+    return;
+  }
+  const nodeRefs: InheritedTargetRef[] = plannedNodeWrites(plan).map(
+    (write) => ({ kind: write.kind, id: write.id }),
+  );
+  for (const [identity, kind] of plan.nodeDeletions) {
+    nodeRefs.push({ kind, id: idOf(identity) });
+  }
+  const idsByKind = bucketInheritedRefsByKind(
+    nodeRefs,
+    new Set(targetNodeVersions.keys()),
+  );
+  for (const [kind, ids] of idsByKind) {
+    const rows = await nodeCollection(nodesApi, kind).getByIds(
+      ids,
+      INCLUDE_TOMBSTONES,
+    );
+    for (const [index, id] of ids.entries()) {
+      const expected = targetNodeVersions.get(mergeKey(kind, id))!;
+      const current = rows[index];
+      if (current?.meta.version === expected) {
+        continue;
+      }
+      throw new BaseVersionMismatchError(
+        `mergeIncremental() observed committed node "${id}" (kind "${kind}") at version ${expected} while planning, but it changed before the commit transaction; the resolved plan no longer describes the live target and was not applied.`,
+        {
+          details: {
+            id,
+            kind,
+            expectedVersion: expected,
+            currentVersion: current?.meta.version,
+          },
+          suggestion:
+            "Re-run mergeIncremental(); the re-planned merge resolves the inherited modifications against the now-committed rows.",
+        },
+      );
+    }
+  }
+}
+
+/**
+ * Signature-checks every committed target edge the plan upserts or deletes. Edges
+ * carry no `version`, so the plan-time baseline is a content fingerprint
+ * ({@link edgeStateSignature}) captured over the target's edge enumeration; a
+ * changed fingerprint means the committed edge's endpoints, liveness, or props
+ * drifted in the plan→commit window.
+ */
+async function assertInheritedEdgesUnchanged<G extends GraphDef>(
+  edgesApi: TxEdges,
+  guard: IncrementalCommitGuard<G>,
+  plan: MergePlan<G>,
+): Promise<void> {
+  const { targetEdgeSignatures } = guard;
+  if (targetEdgeSignatures.size === 0) {
+    return;
+  }
+  const edgeRefs: InheritedTargetRef[] = plan.mergedEdges.map((edge) => ({
+    kind: edge.kind,
+    id: edge.id,
+  }));
+  for (const [identity, kind] of plan.edgeDeletions) {
+    edgeRefs.push({ kind, id: idOf(identity) });
+  }
+  const idsByKind = bucketInheritedRefsByKind(
+    edgeRefs,
+    new Set(targetEdgeSignatures.keys()),
+  );
+  for (const [kind, ids] of idsByKind) {
+    const rows = await edgeCollection(edgesApi, kind).getByIds(
+      ids,
+      INCLUDE_TOMBSTONES,
+    );
+    for (const [index, id] of ids.entries()) {
+      const expected = targetEdgeSignatures.get(mergeKey(kind, id))!;
+      const current = rows[index];
+      const currentSignature =
+        current === undefined ? undefined : (
+          edgeStateSignature({
+            fromKind: current.fromKind,
+            fromId: current.fromId,
+            toKind: current.toKind,
+            toId: current.toId,
+            live: current.meta.deletedAt === undefined,
+            props: edgeProps(current),
+          })
+        );
+      if (currentSignature === expected) {
+        continue;
+      }
+      throw new BaseVersionMismatchError(
+        `mergeIncremental() observed committed edge "${id}" (kind "${kind}") while planning, but its endpoints, liveness, or props changed before the commit transaction; the resolved plan no longer describes the live target and was not applied.`,
+        {
+          details: { id, kind },
+          suggestion:
+            "Re-run mergeIncremental(); the re-planned merge resolves the inherited modifications against the now-committed rows.",
+        },
+      );
+    }
+  }
+}
+
 /**
  * The full incremental commit path (§6.6). The planner has already folded the live
  * target in as a preferred synthetic branch, so this path preflights destructive
@@ -2404,6 +2593,9 @@ async function commitIncrementalPlan<G extends GraphDef>(
       // plan if a matching committed row appeared in the window. `tx` exposes
       // the same `.nodes` collection record a `BaseLookupStore` needs.
       await assertBaseResolutionStable(tx as unknown as BaseLookupStore, guard);
+      // Inherited-row TOCTOU guard: refuse if a committed node OR edge the plan
+      // writes or deletes changed since it was observed at plan time (lost update).
+      await assertInheritedTargetUnchanged(nodesApi, edgesApi, guard, plan);
       await validateIncrementalNodeWrites(target, nodesApi, plan);
       await validateIncrementalEdgeWrites(target, edgesApi, plan);
       return applyMergePlan(plan, nodesApi, edgesApi);
