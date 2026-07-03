@@ -50,19 +50,6 @@ export function mergeKey(kind: string, id: string): MergeKey {
   return `${kind}${SEPARATOR}${id}` as MergeKey;
 }
 
-/**
- * Lexicographic comparator over two strings (node/edge ids, kinds, property names,
- * bucket keys, branches). The single shared total-order primitive the merge pipeline's
- * deterministic sorts are built on.
- */
-export function compareStrings(left: string, right: string): number {
-  return (
-    left < right ? -1
-    : left > right ? 1
-    : 0
-  );
-}
-
 /** Builds the composite identity key for any object carrying a `kind` and `id`. */
 export function mergeKeyOf(
   node: Readonly<{ kind: string; id: string }>,
@@ -103,3 +90,5 @@ export function compareMergeKeys(left: MergeKey, right: MergeKey): number {
     : 0
   );
 }
+
+export { compareStrings } from "../utils/compare";

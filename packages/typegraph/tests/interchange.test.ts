@@ -8,6 +8,7 @@ import { z } from "zod";
 
 import { defineEdge, defineGraph, defineNode } from "../src";
 import type { GraphBackend } from "../src/backend/types";
+import { UniquenessError } from "../src/errors";
 import {
   exportGraph,
   type GraphData,
@@ -661,5 +662,395 @@ describe("Canonical validity-window validation", () => {
     expect(
       await targetStore.nodes.Person.getById("person-1" as never),
     ).toBeUndefined();
+  });
+});
+
+// ============================================================
+// Import Integrity (uniqueness side-table maintenance)
+// ============================================================
+
+const UniquePerson = defineNode("Person", {
+  schema: z.object({
+    name: z.string(),
+    email: z.string(),
+  }),
+});
+
+const uniqueGraph = defineGraph({
+  id: "interchange_unique_test",
+  nodes: {
+    Person: {
+      type: UniquePerson,
+      unique: [
+        {
+          name: "email",
+          fields: ["email"],
+          scope: "kind",
+          collation: "binary",
+        },
+      ],
+    },
+  },
+  edges: {},
+});
+
+const TwoUniquePerson = defineNode("Person", {
+  schema: z.object({
+    name: z.string(),
+    email: z.string(),
+    username: z.string(),
+  }),
+});
+
+// Two independent unique constraints; `email` is declared first so a per-
+// constraint update would mutate its sidecar before reaching the conflicting
+// `username`.
+const twoUniqueGraph = defineGraph({
+  id: "interchange_two_unique_test",
+  nodes: {
+    Person: {
+      type: TwoUniquePerson,
+      unique: [
+        {
+          name: "email",
+          fields: ["email"],
+          scope: "kind",
+          collation: "binary",
+        },
+        {
+          name: "username",
+          fields: ["username"],
+          scope: "kind",
+          collation: "binary",
+        },
+      ],
+    },
+  },
+  edges: {},
+});
+
+describe("Interchange import integrity", () => {
+  it("writes uniqueness entries so a later create detects the conflict", async () => {
+    const source = createStore(uniqueGraph, createTestBackend());
+    await source.nodes.Person.create({
+      name: "Alice",
+      email: "alice@example.com",
+    });
+    const exported = await exportGraph(source);
+
+    const target = createStore(uniqueGraph, createTestBackend());
+    const result = await importGraph(
+      target,
+      exported,
+      importOptions({ onConflict: "error" }),
+    );
+    expect(result.success).toBe(true);
+    expect(result.nodes.created).toBe(1);
+
+    // The imported node's uniqueness entry must exist, so creating another
+    // Person with the same email is rejected. Before the write-pipeline
+    // migration, import skipped the side-table write and this create would
+    // have succeeded — a silent duplicate the store believes is impossible.
+    await expect(
+      target.nodes.Person.create({
+        name: "Alice II",
+        email: "alice@example.com",
+      }),
+    ).rejects.toThrow(UniquenessError);
+  });
+
+  it("rejects a duplicate unique value within a single import", async () => {
+    const source = createStore(uniqueGraph, createTestBackend());
+    await source.nodes.Person.create({ name: "A", email: "a@example.com" });
+    await source.nodes.Person.create({ name: "B", email: "b@example.com" });
+    const exported = await exportGraph(source);
+
+    // Force both exported people to share an email — a duplicate the store's
+    // uniqueness constraint forbids. The second import row must fail its
+    // uniqueness check (against the first row's just-written entry) rather than
+    // import cleanly.
+    const duplicated: GraphData = {
+      ...exported,
+      nodes: exported.nodes.map((node) => ({
+        ...node,
+        properties: { ...node.properties, email: "same@example.com" },
+      })),
+    };
+
+    const target = createStore(uniqueGraph, createTestBackend());
+    const result = await importGraph(
+      target,
+      duplicated,
+      importOptions({ onConflict: "error" }),
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.nodes.created).toBe(1);
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]?.entityType).toBe("node");
+  });
+
+  it("a failed unique update preserves the old key (onConflict: update)", async () => {
+    // Source doc: person-a now carries b@example.com — the conflicting update.
+    const source = createStore(uniqueGraph, createTestBackend());
+    await source.nodes.Person.create(
+      { name: "A", email: "b@example.com" },
+      { id: "person-a" },
+    );
+    const document = await exportGraph(source);
+
+    // Target: person-a reserves a@example.com, person-b reserves b@example.com.
+    const target = createStore(uniqueGraph, createTestBackend());
+    await target.nodes.Person.create(
+      { name: "A", email: "a@example.com" },
+      { id: "person-a" },
+    );
+    await target.nodes.Person.create(
+      { name: "B", email: "b@example.com" },
+      { id: "person-b" },
+    );
+
+    const result = await importGraph(
+      target,
+      document,
+      importOptions({ onConflict: "update" }),
+    );
+
+    // Updating person-a to b@example.com conflicts with person-b — reported as a
+    // per-row error, not applied.
+    expect(result.success).toBe(false);
+    expect(result.errors.length).toBeGreaterThan(0);
+
+    // person-a must STILL reserve a@example.com. Before the fix,
+    // updateUniquenessEntries deleted the old key before the conflict check and
+    // the import swallowed the throw, so this create wrongly succeeded — a
+    // silent loss of person-a's uniqueness reservation.
+    await expect(
+      target.nodes.Person.create({ name: "C", email: "a@example.com" }),
+    ).rejects.toThrow(UniquenessError);
+  });
+
+  it("preflights all unique constraints before mutating any sidecar (onConflict: update)", async () => {
+    // Source doc updates person-a to email c@example.com (free) AND username
+    // "buser" (held by person-b) — the first constraint would change cleanly, the
+    // second conflicts.
+    const source = createStore(twoUniqueGraph, createTestBackend());
+    await source.nodes.Person.create(
+      { name: "A", email: "c@example.com", username: "buser" },
+      { id: "person-a" },
+    );
+    const document = await exportGraph(source);
+
+    const target = createStore(twoUniqueGraph, createTestBackend());
+    await target.nodes.Person.create(
+      { name: "A", email: "a@example.com", username: "auser" },
+      { id: "person-a" },
+    );
+    await target.nodes.Person.create(
+      { name: "B", email: "b@example.com", username: "buser" },
+      { id: "person-b" },
+    );
+
+    const result = await importGraph(
+      target,
+      document,
+      importOptions({ onConflict: "update" }),
+    );
+
+    // The username conflict is reported per-row; nothing is applied.
+    expect(result.success).toBe(false);
+    expect(result.errors.length).toBeGreaterThan(0);
+
+    // The EARLIER (email) constraint must not have been touched. Before the
+    // two-phase preflight, updateUniquenessEntries mutated email's sidecar before
+    // reaching the conflicting username, so both of these went wrong:
+    //   - person-a's old email key was released (this create wrongly succeeded);
+    await expect(
+      target.nodes.Person.create({
+        name: "C",
+        email: "a@example.com",
+        username: "cuser",
+      }),
+    ).rejects.toThrow(UniquenessError);
+    //   - and c@example.com was wrongly reserved for person-a (this failed).
+    const created = await target.nodes.Person.create({
+      name: "D",
+      email: "c@example.com",
+      username: "duser",
+    });
+    expect(created.email).toBe("c@example.com");
+  });
+
+  it("never creates a live edge pointing at a tombstoned batch node", async () => {
+    // Target: person-a exists but is soft-deleted.
+    const target = createStore(testGraph, createTestBackend());
+    await target.nodes.Person.create({ name: "A" }, { id: "person-a" });
+    await target.nodes.Person.delete("person-a" as never);
+
+    // Document: person-a (will be tombstone-skipped), person-b (created),
+    // and an edge person-a -> person-b.
+    const source = createStore(testGraph, createTestBackend());
+    const personA = await source.nodes.Person.create(
+      { name: "A" },
+      { id: "person-a" },
+    );
+    const personB = await source.nodes.Person.create(
+      { name: "B" },
+      { id: "person-b" },
+    );
+    await source.edges.knows.create(personA, personB, {}, { id: "knows-ab" });
+    const document = await exportGraph(source);
+
+    const result = await importGraph(
+      target,
+      document,
+      importOptions({ onConflict: "update" }),
+    );
+
+    // The tombstone skip must NOT count person-a as an available edge
+    // endpoint: the edge is rejected per-row instead of silently violating
+    // the endpoint-liveness invariant the collection API enforces.
+    expect(result.nodes.skipped).toBe(1);
+    expect(result.nodes.created).toBe(1);
+    expect(result.edges.created).toBe(0);
+    expect(result.success).toBe(false);
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]).toMatchObject({ entityType: "edge" });
+    await expect(
+      target.edges.knows.getById("knows-ab" as never),
+    ).resolves.toBeUndefined();
+  });
+
+  it("rejects edges referencing tombstoned nodes outside the batch", async () => {
+    // Target: person-a exists only as a tombstone and is NOT in the import
+    // document, so the reference check falls back to the database — which
+    // must require a LIVE row.
+    const target = createStore(testGraph, createTestBackend());
+    await target.nodes.Person.create({ name: "A" }, { id: "person-a" });
+    await target.nodes.Person.delete("person-a" as never);
+
+    const source = createStore(testGraph, createTestBackend());
+    const personB = await source.nodes.Person.create(
+      { name: "B" },
+      { id: "person-b" },
+    );
+    const document = await exportGraph(source);
+    const withEdge: GraphData = {
+      ...document,
+      edges: [
+        {
+          kind: "knows",
+          id: "knows-ab",
+          from: { kind: "Person", id: "person-a" },
+          to: { kind: "Person", id: personB.id },
+          properties: {},
+        },
+      ],
+    };
+
+    const result = await importGraph(
+      target,
+      withEdge,
+      importOptions({ onConflict: "error" }),
+    );
+
+    expect(result.edges.created).toBe(0);
+    expect(result.success).toBe(false);
+    expect(result.errors[0]?.error).toContain("From node not found");
+  });
+
+  it("skips tombstoned nodes without touching their sidecars (onConflict: update)", async () => {
+    // Source doc: person-a with a new email.
+    const source = createStore(uniqueGraph, createTestBackend());
+    await source.nodes.Person.create(
+      { name: "A", email: "new@example.com" },
+      { id: "person-a" },
+    );
+    const document = await exportGraph(source);
+
+    // Target: person-a existed, then was soft-deleted — the delete removed
+    // its uniqueness entry (and any embedding/fulltext rows).
+    const target = createStore(uniqueGraph, createTestBackend());
+    await target.nodes.Person.create(
+      { name: "A", email: "old@example.com" },
+      { id: "person-a" },
+    );
+    await target.nodes.Person.delete("person-a" as never);
+
+    const result = await importGraph(
+      target,
+      document,
+      importOptions({ onConflict: "update" }),
+    );
+
+    // Import never resurrects a tombstone: the row is skipped, stays
+    // tombstoned, and no uniqueness reservation is made for it — a live
+    // create of the same value has to succeed.
+    expect(result.success).toBe(true);
+    expect(result.nodes.updated).toBe(0);
+    expect(result.nodes.skipped).toBe(1);
+    await expect(
+      target.nodes.Person.getById("person-a" as never),
+    ).resolves.toBeUndefined();
+    const created = await target.nodes.Person.create({
+      name: "C",
+      email: "new@example.com",
+    });
+    expect(created.email).toBe("new@example.com");
+  });
+});
+
+// ============================================================
+// Import Property Fidelity (onUnknownProperty: "allow")
+// ============================================================
+
+const TransformDocument = defineNode("Doc", {
+  schema: z.object({
+    title: z.string().transform((value) => value.trim()),
+    status: z.string().default("draft"),
+  }),
+});
+
+const transformGraph = defineGraph({
+  id: "interchange_transform_test",
+  nodes: { Doc: { type: TransformDocument } },
+  edges: {},
+});
+
+describe("Interchange import property fidelity", () => {
+  it("preserves properties verbatim under onUnknownProperty: allow", async () => {
+    const store = createStore(transformGraph, createTestBackend());
+    const data: GraphData = {
+      formatVersion: "1.0",
+      exportedAt: "2024-01-01T00:00:00.000Z",
+      source: { type: "external" },
+      nodes: [
+        {
+          kind: "Doc",
+          id: "d1",
+          properties: { title: "  hello  ", extra: "keepme" },
+        },
+      ],
+      edges: [],
+    };
+
+    const result = await importGraph(
+      store,
+      data,
+      importOptions({ onConflict: "error", onUnknownProperty: "allow" }),
+    );
+    expect(result.success).toBe(true);
+    expect(result.nodes.created).toBe(1);
+
+    // "allow" is the fidelity-preserving strategy: the schema validates the
+    // known fields, but the given properties are persisted byte-for-byte —
+    // no transform re-application, no default injection — so an
+    // export→import round trip cannot mutate stored values (a re-applied
+    // non-idempotent transform would corrupt them). Use "strip" for a
+    // normalizing import.
+    const document = await store.nodes.Doc.getById("d1" as never);
+    expect(document?.title).toBe("  hello  ");
+    expect((document as unknown as { status?: string }).status).toBeUndefined();
+    expect((document as unknown as { extra?: string }).extra).toBe("keepme");
   });
 });

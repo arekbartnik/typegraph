@@ -22,14 +22,100 @@ type ClockRow = Readonly<{ recorded_at: unknown }>;
 const RECORDED_MIN = "1970-01-01T00:00:00.000Z";
 const RECORDED_MAX_TIME = new Date(RECORDED_MAX).getTime();
 const RECORDED_CLOCK_ADVISORY_LOCK_NAMESPACE = "typegraph:recorded-clock";
+const RECORDED_GRAPH_WRITE_ADVISORY_LOCK_NAMESPACE =
+  "typegraph:recorded-graph-write";
 
-export function recordedClockAdvisoryLockSql(graphId: string): SQL {
+/**
+ * Builds a `pg_advisory_xact_lock` call scoped to a `(namespace, graphId)` pair.
+ * Keep lock namespaces tied to acquire order, not to feature names:
+ *
+ * - recorded graph writes take `typegraph:recorded-graph-write` before any row
+ *   reads/writes that can affect graph state;
+ * - recorded-clock allocation takes `typegraph:recorded-clock` late, at flush,
+ *   after the live writes have already happened.
+ *
+ * Sharing one key across those two acquire-order positions creates a circular
+ * wait under ordinary concurrent load.
+ */
+function graphAdvisoryLockSql(namespace: string, graphId: string): SQL {
   return sql`
     SELECT pg_advisory_xact_lock(
-      hashtext(${RECORDED_CLOCK_ADVISORY_LOCK_NAMESPACE}),
+      hashtext(${namespace}),
       hashtext(${graphId})
     )
   `;
+}
+
+export function recordedClockAdvisoryLockSql(graphId: string): SQL {
+  return graphAdvisoryLockSql(RECORDED_CLOCK_ADVISORY_LOCK_NAMESPACE, graphId);
+}
+
+export function recordedGraphWriteAdvisoryLockSql(graphId: string): SQL {
+  return graphAdvisoryLockSql(
+    RECORDED_GRAPH_WRITE_ADVISORY_LOCK_NAMESPACE,
+    graphId,
+  );
+}
+
+declare const GRAPH_WRITE_LOCK_BRAND: unique symbol;
+
+/**
+ * Compile-time evidence that the per-graph write-lock discipline was
+ * satisfied BEFORE any row work in the current transaction — either the
+ * advisory lock was actually acquired ({@link lockRecordedGraphWrite}, on a
+ * capture-enabled Postgres store) or the store provably needs no lock
+ * ({@link uncapturedGraphWriteLock}). Functions that perform captured row
+ * writes (the node write pipeline) require this token as a parameter, so
+ * "sidecar write before lock" is a compile error rather than a lock-order
+ * inversion found in review.
+ */
+export type GraphWriteLock = Readonly<{
+  [GRAPH_WRITE_LOCK_BRAND]: true;
+}>;
+
+// The brand is compile-time only (a `unique symbol` with no runtime value —
+// see the `declare const` above), so the token carries no actual per-call
+// data and every acquisition can share this one frozen empty instance.
+const GRAPH_WRITE_LOCK_EVIDENCE = Object.freeze({}) as GraphWriteLock;
+
+function graphWriteLockEvidence(): GraphWriteLock {
+  return GRAPH_WRITE_LOCK_EVIDENCE;
+}
+
+/**
+ * Evidence constructor for stores WITHOUT history capture, where no
+ * advisory lock exists to acquire. Calling this is an explicit claim that
+ * the target store is not capture-enabled — do not use it to skip the lock
+ * on a history store.
+ */
+export function uncapturedGraphWriteLock(): GraphWriteLock {
+  return graphWriteLockEvidence();
+}
+
+export async function lockRecordedGraphWrite(
+  target: Pick<TransactionBackend, "dialect" | "execute">,
+  graphId: string,
+): Promise<GraphWriteLock> {
+  if (target.dialect !== "postgres") return graphWriteLockEvidence();
+  await target.execute(
+    asCompiledRowsSql(recordedGraphWriteAdvisoryLockSql(graphId)),
+  );
+  return graphWriteLockEvidence();
+}
+
+export async function lockRecordedGraphWrites(
+  target: Pick<TransactionBackend, "dialect" | "execute">,
+  graphIds: Iterable<string>,
+): Promise<void> {
+  if (target.dialect !== "postgres") return;
+  // Codepoint sort, NOT localeCompare: every process must acquire multi-graph
+  // locks in the same order, and locale-sensitive collation varies with the
+  // host's ICU configuration — two processes sorting the same ids differently
+  // would take the same lock pair in opposite orders and deadlock.
+  const uniqueGraphIds = [...new Set(graphIds)].toSorted();
+  for (const graphId of uniqueGraphIds) {
+    await lockRecordedGraphWrite(target, graphId);
+  }
 }
 
 function failInvalidClockTimestamp(value: unknown): never {

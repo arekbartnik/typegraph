@@ -42,6 +42,11 @@
       "import": "./dist/graph-merge/index.js",
       "require": "./dist/graph-merge/index.cjs"
     },
+    "./provenance": {
+      "types": "./dist/provenance/index.d.ts",
+      "import": "./dist/provenance/index.js",
+      "require": "./dist/provenance/index.cjs"
+    },
     "./sqlite": {
       "types": "./dist/backend/sqlite/index.d.ts",
       "import": "./dist/backend/sqlite/index.js",
@@ -97,7 +102,8 @@
     "test:postgres": "./scripts/test-postgres.sh",
     "test:do": "vitest run --config vitest.workers.config.ts",
     "test:coverage": "vitest run --coverage",
-    "test:mutation": "stryker run"
+    "test:mutation": "stryker run",
+    "test:mutation:critical": "stryker run stryker.critical.config.json"
   },
   "keywords": [
     "graph",

@@ -157,6 +157,7 @@ import {
   createHistoryUnsafeSqlRef,
   createRecordedBackend,
   createRecordedTransactionScope,
+  lockRecordedGraphWrite,
   readRecordedClock,
   recordedCaptureRequiresCallbackTransactionError,
   withRecordedRelationsPrecondition,
@@ -317,6 +318,23 @@ export type ReembedVectorFieldResult = Readonly<{
   recreated: boolean;
   /** Number of nodes whose embedding was re-written (0 without `embed`). */
   reembedded: number;
+}>;
+
+/** One place for the hooks' error normalization. */
+function asError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
+}
+
+/** The `(hook context, operation body)` wrapper shape operation contexts carry. */
+type OperationHookRunner = <T>(
+  ctx: OperationHookContext,
+  fn: () => Promise<T>,
+) => Promise<T>;
+
+/** A committed-inside-the-transaction operation awaiting the outer COMMIT. */
+type PendingOperationOutcome = Readonly<{
+  ctx: OperationHookContext;
+  durationMs: number;
 }>;
 
 export class Store<G extends GraphDef> {
@@ -684,7 +702,10 @@ export class Store<G extends GraphDef> {
    * Node operations bound to this store instance.
    */
   get #nodeOperations(): NodeOperations {
-    const ctx = this.#createNodeOperationContext();
+    return this.#buildNodeOperations(this.#createNodeOperationContext());
+  }
+
+  #buildNodeOperations(ctx: NodeOperationContext<G>): NodeOperations {
     return {
       defaultTemporalMode: this.#graph.defaults.temporalMode,
       rowToNode: (row) => rowToNode(row),
@@ -764,7 +785,10 @@ export class Store<G extends GraphDef> {
    * Edge operations bound to this store instance.
    */
   get #edgeOperations(): EdgeOperations {
-    const ctx = this.#createEdgeOperationContext();
+    return this.#buildEdgeOperations(this.#createEdgeOperationContext());
+  }
+
+  #buildEdgeOperations(ctx: EdgeOperationContext<G>): EdgeOperations {
     return {
       defaultTemporalMode: this.#graph.defaults.temporalMode,
       rowToEdge: (row) => rowToEdge(row),
@@ -1365,6 +1389,14 @@ export class Store<G extends GraphDef> {
         nodes: this.nodes,
         edges: this.edges,
         backend: this.#backend,
+        getNodeCollection: (kind) => this.getNodeCollection(kind),
+        // No transaction, no deferral: operations apply as they happen, so
+        // their hooks fire immediately.
+        runNodeOperationHooks: (operation, kind, id, hookedFunction) =>
+          this.#withOperationHooks(
+            this.#createOperationContext(operation, "node", kind, id),
+            hookedFunction,
+          ),
       });
     }
 
@@ -1372,11 +1404,40 @@ export class Store<G extends GraphDef> {
     // tx-scoped fulltext methods so the durable-marker assert fires at
     // point of use (a cached SELECT, never DDL). A transaction that
     // never touches fulltext requires no fulltext initialization.
-    return this.#backend.transaction(
-      async (txBackend, sql) =>
-        invoke(this.#buildTransactionContext(txBackend, sql)),
-      options,
-    );
+    //
+    // No per-graph write lock here either: under history capture the lock is
+    // taken at each write boundary (runInWriteTransaction before any row work;
+    // the recorded overlay before each row write), so a transaction whose
+    // callback only reads never serializes against writers. Callers that need
+    // read-before-write serialization across the whole callback (provenance
+    // transitions) acquire the lock explicitly at callback start.
+    //
+    // Operation hooks inside the callback run BUFFERED: an operation nested
+    // in this transaction completes only when the transaction commits, so its
+    // onOperationEnd is held back until after COMMIT — and converted into
+    // onError when the transaction fails — keeping "success" synonymous with
+    // "durable" even for tx-scoped collection operations.
+    const pending: PendingOperationOutcome[] = [];
+    const runHooks = this.#createBufferedHookRunner(pending);
+    try {
+      const result = await this.#backend.transaction(
+        async (txBackend, sql) =>
+          invoke(this.#buildTransactionContext(txBackend, sql, runHooks)),
+        options,
+      );
+      for (const outcome of pending) {
+        this.#hooks.onOperationEnd?.(outcome.ctx, {
+          durationMs: outcome.durationMs,
+        });
+      }
+      return result;
+    } catch (error) {
+      const failure = asError(error);
+      for (const outcome of pending) {
+        this.#hooks.onError?.(outcome.ctx, failure);
+      }
+      throw error;
+    }
   }
 
   /**
@@ -1517,6 +1578,9 @@ export class Store<G extends GraphDef> {
           backend: txBackend,
           flush: () => Promise.resolve(),
         };
+    if (this.#captureEnabled) {
+      await lockRecordedGraphWrite(scope.backend, this.graphId);
+    }
     const invoke = fn as (tx: TransactionContext<G>) => Promise<T>;
     const result = await invoke(
       this.#buildTransactionContext(scope.backend, externalTx),
@@ -1538,15 +1602,24 @@ export class Store<G extends GraphDef> {
   #buildTransactionContext(
     txBackend: TransactionBackend,
     sql?: AdoptedTransaction,
+    runHooks: OperationHookRunner = this.#immediateHookRunner(),
   ): TransactionContext<G> {
     const txNodeOperations: NodeOperations = {
-      ...this.#nodeOperations,
+      ...this.#buildNodeOperations(this.#createNodeOperationContext(runHooks)),
       createQuery: () => this.#createQueryForBackend(txBackend),
     };
     const txEdgeOperations: EdgeOperations = {
-      ...this.#edgeOperations,
+      ...this.#buildEdgeOperations(this.#createEdgeOperationContext(runHooks)),
       createQuery: () => this.#createQueryForBackend(txBackend),
     };
+
+    const runNodeOperationHooks = <T>(
+      operation: "create" | "update" | "delete",
+      kind: string,
+      id: string,
+      fn: () => Promise<T>,
+    ): Promise<T> =>
+      runHooks(this.#createOperationContext(operation, "node", kind, id), fn);
 
     const nodes = createNodeCollectionsProxy(
       this.#graph,
@@ -1564,9 +1637,33 @@ export class Store<G extends GraphDef> {
       txEdgeOperations,
     );
 
-    if (sql === undefined) return { nodes, edges, backend: txBackend };
+    const getNodeCollection = (
+      kind: string,
+    ): DynamicNodeCollection | undefined => {
+      if (!Object.hasOwn(this.#graph.nodes, kind)) return undefined;
+      return nodes[
+        kind as keyof G["nodes"] & string
+      ] as unknown as DynamicNodeCollection;
+    };
+
+    if (sql === undefined) {
+      return {
+        nodes,
+        edges,
+        backend: txBackend,
+        getNodeCollection,
+        runNodeOperationHooks,
+      };
+    }
     const exposedSql = this.#captureEnabled ? createHistoryUnsafeSqlRef() : sql;
-    return { nodes, edges, sql: exposedSql, backend: txBackend };
+    return {
+      nodes,
+      edges,
+      sql: exposedSql,
+      backend: txBackend,
+      getNodeCollection,
+      runNodeOperationHooks,
+    };
   }
 
   // === Graph Lifecycle ===
@@ -2471,7 +2568,14 @@ export class Store<G extends GraphDef> {
 
   // === Internal: Operation Contexts ===
 
-  #createNodeOperationContext(): NodeOperationContext<G> {
+  #immediateHookRunner(): OperationHookRunner {
+    return <T>(ctx: OperationHookContext, fn: () => Promise<T>) =>
+      this.#withOperationHooks(ctx, fn);
+  }
+
+  #createNodeOperationContext(
+    runHooks: OperationHookRunner = this.#immediateHookRunner(),
+  ): NodeOperationContext<G> {
     return {
       graph: this.#graph,
       graphId: this.graphId,
@@ -2479,24 +2583,21 @@ export class Store<G extends GraphDef> {
       registry: this.#registry,
       createOperationContext: (operation, entity, kind, id) =>
         this.#createOperationContext(operation, entity, kind, id),
-      withOperationHooks: <T>(
-        ctx: OperationHookContext,
-        fn: () => Promise<T>,
-      ) => this.#withOperationHooks(ctx, fn),
+      withOperationHooks: runHooks,
     };
   }
 
-  #createEdgeOperationContext(): EdgeOperationContext<G> {
+  #createEdgeOperationContext(
+    runHooks: OperationHookRunner = this.#immediateHookRunner(),
+  ): EdgeOperationContext<G> {
     return {
       graph: this.#graph,
       graphId: this.graphId,
+      historyEnabled: this.#captureEnabled,
       registry: this.#registry,
       createOperationContext: (operation, entity, kind, id) =>
         this.#createOperationContext(operation, entity, kind, id),
-      withOperationHooks: <T>(
-        ctx: OperationHookContext,
-        fn: () => Promise<T>,
-      ) => this.#withOperationHooks(ctx, fn),
+      withOperationHooks: runHooks,
     };
   }
 
@@ -2538,12 +2639,39 @@ export class Store<G extends GraphDef> {
       });
       return result;
     } catch (error) {
-      this.#hooks.onError?.(
-        ctx,
-        error instanceof Error ? error : new Error(String(error)),
-      );
+      this.#hooks.onError?.(ctx, asError(error));
       throw error;
     }
+  }
+
+  /**
+   * A hook runner for operations that execute INSIDE an explicit
+   * `store.transaction`: `onOperationStart` (and a failed operation's
+   * `onError`) fire immediately — the attempt and the failure are real when
+   * they happen — but a successful operation's `onOperationEnd` is only
+   * BUFFERED. `transaction()` flushes the buffer after the backend COMMIT
+   * succeeds, or converts every buffered success into `onError` when the
+   * transaction fails, so `onOperationEnd` always means durably committed
+   * even for operations nested in a caller-controlled transaction.
+   */
+  #createBufferedHookRunner(
+    pending: PendingOperationOutcome[],
+  ): OperationHookRunner {
+    return async <T>(
+      ctx: OperationHookContext,
+      fn: () => Promise<T>,
+    ): Promise<T> => {
+      this.#hooks.onOperationStart?.(ctx);
+      const startTime = Date.now();
+      try {
+        const result = await fn();
+        pending.push({ ctx, durationMs: Date.now() - startTime });
+        return result;
+      } catch (error) {
+        this.#hooks.onError?.(ctx, asError(error));
+        throw error;
+      }
+    };
   }
 
   // === Internal: Temporal Filtering ===
