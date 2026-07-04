@@ -256,7 +256,7 @@ export const pgvectorStrategy: VectorStrategy = {
     ];
   },
 
-  buildSearch(slot, params: VectorSearchParams): SQL {
+  buildSearch(slot, params: VectorSearchParams, candidates?: SQL): SQL {
     const table = quotedTableName(
       this.tableName(slot.graphId, slot.nodeKind, slot.fieldPath),
     );
@@ -277,13 +277,39 @@ export const pgvectorStrategy: VectorStrategy = {
         vectorMinScoreCondition(distance, params.metric, params.minScore),
       );
     }
-    return sql`
+    // Candidate pushdown keeps the HNSW scan (verified plan: HNSW Index Scan
+    // -> Nested Loop probe of the nodes pkey -> Limit). Exact under
+    // `hnsw.iterative_scan` (pgvector >= 0.8, applied by the backend);
+    // bounded by `ef_search` on older pgvector — still strictly better than
+    // ranking tombstones into top-k and dropping them post-hoc.
+    if (candidates !== undefined) {
+      conditions.push(sql`${table}."node_id" IN (${candidates})`);
+    }
+    const body = sql`
       SELECT ${table}."node_id" AS node_id, ${score} AS score
       FROM ${table}
       WHERE ${sql.join(conditions, sql` AND `)}
       ORDER BY ${distance} ASC
       LIMIT ${params.limit}
     `;
+    // IVFFlat's iterative scan only offers `relaxed_order` (no
+    // strict_order mode), so under the backend-applied
+    // `ivfflat.iterative_scan` the index may emit the candidate set
+    // slightly out of distance order. Re-sort the bounded set inside a
+    // MATERIALIZED wrapper — the fence stops the planner from collapsing
+    // the sort back into the index scan's claimed ordering. Score is
+    // monotone in distance, so ordering by score per the metric's
+    // direction restores exact ranking.
+    if (slot.indexType === "ivfflat") {
+      const direction =
+        params.metric === "cosine" ? sql.raw("DESC") : sql.raw("ASC");
+      return sql`
+        WITH tg_vec_relaxed AS MATERIALIZED (${body})
+        SELECT node_id, score FROM tg_vec_relaxed
+        ORDER BY score ${direction}, node_id ASC
+      `;
+    }
+    return body;
   },
 
   distanceExpression(embeddingColumn, queryEmbedding, metric) {
