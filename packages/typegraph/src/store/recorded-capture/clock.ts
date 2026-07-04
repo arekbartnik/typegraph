@@ -92,30 +92,79 @@ export function uncapturedGraphWriteLock(): GraphWriteLock {
   return graphWriteLockEvidence();
 }
 
-export async function lockRecordedGraphWrite(
-  target: Pick<TransactionBackend, "dialect" | "execute">,
+/**
+ * Per-transaction memo of graphs whose advisory lock is already held.
+ *
+ * `pg_advisory_xact_lock` is reentrant and held until the top-level
+ * transaction ends, so re-acquiring it on every captured write inside one
+ * transaction is pure round-trip churn — a multi-write transaction paid one
+ * lock round trip per write. The capture layer registers its per-transaction
+ * backend here; every lock path that receives that backend (the capture
+ * delegate's own writes, `runInWriteTransaction`, provenance) then skips the
+ * SQL once the graph's lock is held.
+ *
+ * Keyed weakly by the backend object: the delegate is created per
+ * transaction, so memo lifetime equals lock lifetime. NOT savepoint-aware —
+ * a manual `SAVEPOINT` rolled back across the first acquisition releases the
+ * lock but not the memo entry. That matches the capture session's touch
+ * state (also not savepoint-scoped); manual savepoints inside a recorded
+ * transaction are outside the capture contract.
+ */
+/**
+ * Single-flight per graph: the memo stores the IN-FLIGHT acquisition
+ * promise, not just completed acquisitions, so concurrent same-transaction
+ * writers (`Promise.all` over captured writes) coalesce onto one advisory
+ * round trip instead of racing past an empty resolved-set. A rejected
+ * acquisition evicts its entry so a retry is not poisoned (in practice a
+ * failed statement has aborted the Postgres transaction anyway).
+ */
+export type RecordedGraphLockMemo = Map<string, Promise<void>>;
+
+export function createRecordedGraphLockMemo(): RecordedGraphLockMemo {
+  return new Map();
+}
+
+const recordedGraphLockMemos = new WeakMap<object, RecordedGraphLockMemo>();
+
+export function registerRecordedGraphLockMemo(
+  backend: object,
+  memo: RecordedGraphLockMemo,
+): void {
+  recordedGraphLockMemos.set(backend, memo);
+}
+
+async function acquireRecordedGraphWriteLock(
+  target: Pick<TransactionBackend, "execute">,
   graphId: string,
-): Promise<GraphWriteLock> {
-  if (target.dialect !== "postgres") return graphWriteLockEvidence();
+): Promise<void> {
   await target.execute(
     asCompiledRowsSql(recordedGraphWriteAdvisoryLockSql(graphId)),
   );
-  return graphWriteLockEvidence();
 }
 
-export async function lockRecordedGraphWrites(
+export async function lockRecordedGraphWrite(
   target: Pick<TransactionBackend, "dialect" | "execute">,
-  graphIds: Iterable<string>,
-): Promise<void> {
-  if (target.dialect !== "postgres") return;
-  // Codepoint sort, NOT localeCompare: every process must acquire multi-graph
-  // locks in the same order, and locale-sensitive collation varies with the
-  // host's ICU configuration — two processes sorting the same ids differently
-  // would take the same lock pair in opposite orders and deadlock.
-  const uniqueGraphIds = [...new Set(graphIds)].toSorted();
-  for (const graphId of uniqueGraphIds) {
-    await lockRecordedGraphWrite(target, graphId);
+  graphId: string,
+  memo?: RecordedGraphLockMemo,
+): Promise<GraphWriteLock> {
+  if (target.dialect !== "postgres") return graphWriteLockEvidence();
+  const effectiveMemo = memo ?? recordedGraphLockMemos.get(target);
+  if (effectiveMemo === undefined) {
+    await acquireRecordedGraphWriteLock(target, graphId);
+    return graphWriteLockEvidence();
   }
+  let pending = effectiveMemo.get(graphId);
+  if (pending === undefined) {
+    pending = acquireRecordedGraphWriteLock(target, graphId).catch(
+      (error: unknown) => {
+        effectiveMemo.delete(graphId);
+        throw error;
+      },
+    );
+    effectiveMemo.set(graphId, pending);
+  }
+  await pending;
+  return graphWriteLockEvidence();
 }
 
 function failInvalidClockTimestamp(value: unknown): never {

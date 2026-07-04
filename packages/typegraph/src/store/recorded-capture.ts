@@ -21,8 +21,9 @@ import {
 } from "./insert-dispatch";
 import {
   allocateRecordedCommit,
+  createRecordedGraphLockMemo,
   lockRecordedGraphWrite,
-  lockRecordedGraphWrites,
+  registerRecordedGraphLockMemo,
 } from "./recorded-capture/clock";
 import {
   entityKey,
@@ -217,20 +218,33 @@ function createRecordedTransactionBackend(
   const nodeDispatch = nodeInsertDispatch(target);
   const edgeDispatch = edgeInsertDispatch(target);
 
+  // One advisory-lock round trip per graph per transaction: the memo is
+  // shared with the returned overlay (see registerRecordedGraphLockMemo),
+  // so external lock paths handed this backend dedupe against the same
+  // single-flight promises — including concurrent same-transaction writers.
+  const graphLocks = createRecordedGraphLockMemo();
+
   async function lockGraph(graphId: string): Promise<void> {
-    await lockRecordedGraphWrite(target, graphId);
+    await lockRecordedGraphWrite(target, graphId, graphLocks);
   }
 
   async function lockGraphs(
     params: readonly Readonly<{ graphId: string }>[],
   ): Promise<void> {
-    await lockRecordedGraphWrites(
-      target,
-      params.map((parameter) => parameter.graphId),
-    );
+    // Codepoint sort, NOT localeCompare: every process must acquire
+    // multi-graph locks in the same order, and locale-sensitive collation
+    // varies with the host's ICU configuration — two processes sorting the
+    // same ids differently would take the same lock pair in opposite
+    // orders and deadlock.
+    const graphIds = [
+      ...new Set(params.map((parameter) => parameter.graphId)),
+    ].toSorted();
+    for (const graphId of graphIds) {
+      await lockRecordedGraphWrite(target, graphId, graphLocks);
+    }
   }
 
-  return createBackendOverlay(target, {
+  const overlay = createBackendOverlay(target, {
     ...rawWriteGuards(target, "tx.backend"),
 
     async insertNode(params) {
@@ -412,6 +426,8 @@ function createRecordedTransactionBackend(
         },
       }),
   });
+  registerRecordedGraphLockMemo(overlay, graphLocks);
+  return overlay;
 }
 
 export function createRecordedTransactionScope(
