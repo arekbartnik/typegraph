@@ -8,6 +8,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 
 import {
+  asEdgeId,
   count,
   defineEdge,
   defineGraph,
@@ -610,6 +611,106 @@ describe("Query Execution (SQLite)", () => {
         "Bob (bob)",
         "Charlie (charlie)",
       ]);
+    });
+
+    it("round-trips a projected node id into getById/getByIds with no cast", async () => {
+      const ids = await store
+        .query()
+        .from("Person", "p")
+        .whereNode("p", (p) => p.name.eq("Alice"))
+        .select((context) => context.p.id)
+        .execute();
+
+      const [aliceId] = ids;
+      expect(aliceId).toBeDefined();
+
+      // No cast: SelectableNode.id is branded NodeId<Person>, matching what
+      // getById/getByIds require.
+      const [alice, [aliceAgain]] = await Promise.all([
+        store.nodes.Person.getById(aliceId!),
+        store.nodes.Person.getByIds([aliceId!]),
+      ]);
+      expect(alice?.name).toBe("Alice");
+      expect(aliceAgain?.name).toBe("Alice");
+    });
+
+    it("keeps a projected edge id as string, requiring asEdgeId to re-brand it", async () => {
+      // Edge ids from .select() stay plain string (see SelectableEdge's
+      // docblock: traverse()'s default expand: "inverse" can back an alias
+      // with a different edge kind than its static type, so getById would
+      // silently return undefined for a mismatched-kind id if this were
+      // auto-branded). asEdgeId is the sanctioned way to re-apply the brand.
+      const edgeIds = await store
+        .query()
+        .from("Person", "p")
+        .whereNode("p", (p) => p.name.eq("Alice"))
+        .traverse("worksAt", "e")
+        .to("Company", "c")
+        .select((context) => context.e.id)
+        .execute();
+
+      const [worksAtId] = edgeIds;
+      expect(worksAtId).toBeDefined();
+      const brandedWorksAtId = asEdgeId<typeof worksAt>(worksAtId!);
+
+      const edge = await store.edges.worksAt.getById(brandedWorksAtId);
+      expect(edge?.role).toBe("Engineer");
+    });
+
+    it("proves why edge ids can't be auto-branded: default expand mixes in the inverse kind", async () => {
+      // Concrete reproduction of the hazard SelectableEdge's docblock
+      // describes: traverse()'s default expand: "inverse" unions in rows
+      // for the registered inverse edge kind, so the row backing an alias
+      // can be a genuinely different edge kind than the one requested.
+      const manages = defineEdge("manages", { schema: z.object({}) });
+      const managedBy = defineEdge("managedBy", { schema: z.object({}) });
+      const orgGraph = defineGraph({
+        id: "inverse_kind_mismatch",
+        nodes: { Person: { type: Person } },
+        edges: {
+          manages: { type: manages, from: [Person], to: [Person] },
+          managedBy: { type: managedBy, from: [Person], to: [Person] },
+        },
+        ontology: [inverseOf(manages, managedBy)],
+      });
+      const orgBackend = createSqliteBackend(createTestDatabase());
+      const orgStore = createStore(orgGraph, orgBackend);
+
+      const boss = await orgStore.nodes.Person.create({ name: "Boss" });
+      const report = await orgStore.nodes.Person.create({ name: "Report" });
+      // Only a `managedBy` edge exists — no literal `manages` edge.
+      const managedByEdge = await orgStore.edges.managedBy.create(
+        report,
+        boss,
+        {},
+      );
+
+      const rows = await orgStore
+        .query()
+        .from("Person", "boss")
+        .whereNode("boss", (p) => p.name.eq("Boss"))
+        .traverse("manages", "e") // default expand: "inverse"
+        .to("Person", "report")
+        .select((context) => ({ id: context.e.id, kind: context.e.kind }))
+        .execute();
+
+      expect(rows).toHaveLength(1);
+      // Statically typed E["kind"] says "manages"; the actual row is the
+      // managedBy edge matched via inverse expansion.
+      expect(rows[0]!.kind).toBe("managedBy");
+      expect(rows[0]!.id).toBe(managedByEdge.id);
+
+      // Blindly trusting the requested alias's kind silently loses data...
+      const wrongKindLookup = await orgStore.edges.manages.getById(
+        asEdgeId<typeof manages>(rows[0]!.id),
+      );
+      expect(wrongKindLookup).toBeUndefined();
+
+      // ...the row only resolves under its real kind.
+      const rightKindLookup = await orgStore.edges.managedBy.getById(
+        asEdgeId<typeof managedBy>(rows[0]!.id),
+      );
+      expect(rightKindLookup?.id).toBe(managedByEdge.id);
     });
   });
 

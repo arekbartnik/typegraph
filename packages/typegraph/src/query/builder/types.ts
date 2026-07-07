@@ -17,6 +17,7 @@ import {
   type AnyEdgeType,
   type EdgeRegistration,
   type EdgeType,
+  type NodeId,
   type NodeType,
   type TemporalMode,
 } from "../../core/types";
@@ -427,11 +428,15 @@ export type SelectableNodeMeta = Readonly<{
  * For aliases declared via `fromDynamic` / `toDynamic` this resolves to
  * `DynamicSelectableNode` — same wire shape, schema properties typed
  * `unknown` for narrowing at the call site.
+ *
+ * `id` carries the same `NodeId<N>` brand as `Node<N>` (see `store/types.ts`)
+ * so a projected id can be passed straight back into `getById`/`getByIds`
+ * without a cast.
  */
 export type SelectableNode<N extends NodeType> =
   IsDynamicNodeType<N> extends true ? DynamicSelectableNode
   : Readonly<{
-      id: string;
+      id: NodeId<N>;
       kind: N["kind"];
       meta: SelectableNodeMeta;
     }> &
@@ -456,6 +461,20 @@ export type SelectableEdgeMeta = Readonly<{
  * - System metadata is under `edge.meta.*`
  *
  * Dynamic-mode counterpart: see `SelectableNode`.
+ *
+ * `id`/`kind`/`fromId`/`toId` stay plain `string`, unlike `SelectableNode`'s
+ * `id: NodeId<N>`. `traverse(edgeKind, alias)` defaults to
+ * `expand: "inverse"` (see `GraphAlgorithms`/`QueryBuilder.traverse`'s
+ * `defaultTraversalExpansion`), which UNIONs in rows for the *registered
+ * inverse* edge kind alongside the requested one — `EdgeAlias<E>`'s `E`
+ * stays pinned to the single requested kind regardless, so under the
+ * default expansion mode the row backing `alias` can genuinely be a
+ * different edge kind than `E` says. Branding `id` as `EdgeId<E>` there
+ * would compile but be actively wrong: `store.edges.<E>.getById()` filters
+ * on `row.kind !== kind` and silently returns `undefined` for a
+ * mismatched-kind id — worse than the unsafe cast it would have replaced.
+ * Safe to brand once `EdgeAlias` tracks whether expansion could have
+ * produced a different kind (`expand: "none"` vs not); see #235's note.
  */
 export type SelectableEdge<E extends AnyEdgeType = EdgeType> =
   IsDynamicEdgeType<E> extends true ? DynamicSelectableEdge
