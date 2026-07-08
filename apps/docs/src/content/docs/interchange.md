@@ -58,7 +58,7 @@ interface GraphData {
     kind: string;
     id: string;
     properties: Record<string, unknown>;
-    validFrom?: string;
+    validFrom?: string | null;
     validTo?: string;
     meta?: {
       version?: number;
@@ -72,7 +72,7 @@ interface GraphData {
     from: { kind: string; id: string };
     to: { kind: string; id: string };
     properties: Record<string, unknown>;
-    validFrom?: string;
+    validFrom?: string | null;
     validTo?: string;
     meta?: {
       createdAt?: string;
@@ -81,6 +81,13 @@ interface GraphData {
   }>;
 }
 ```
+
+`validFrom` has three states: the key **absent** means it wasn't requested
+(`includeTemporal: false`, the default) — import defaults it to the
+import's own creation timestamp. An **explicit `null`** means the source
+row is confirmed to have no lower bound (open-left validity) — import
+preserves that instead of re-stamping it. A **string** is an explicit
+value, carried through unchanged.
 
 ## Exporting Data
 
@@ -127,6 +134,15 @@ const withDeleted = await exportGraph(store, {
 | `includeMeta` | `boolean` | `false` | Include version and timestamps |
 | `includeTemporal` | `boolean` | `false` | Include validFrom/validTo fields |
 | `includeDeleted` | `boolean` | `false` | Include soft-deleted records |
+
+**Round-trip caveat:** with the default `includeTemporal: false`, exported
+records carry no `validFrom`/`validTo`. On import, an omitted `validFrom`
+defaults to the *import's own* creation timestamp — so a plain
+`exportGraph` + `importGraph` round trip does **not** reproduce the
+source's original valid-time window; every imported record becomes valid
+from import time forward. Pass `includeTemporal: true` on export when the
+clone needs to match the source's `asOf` behavior exactly (this is what
+`branch()` does internally).
 
 ## Importing Data
 

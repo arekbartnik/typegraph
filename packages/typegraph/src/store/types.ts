@@ -547,7 +547,11 @@ export type NodeCollection<
   N extends NodeType,
   CN extends string = string,
 > = Readonly<{
-  /** Create a new node */
+  /**
+   * Create a new node.
+   *
+   * `validFrom` defaults to the operation's creation timestamp when omitted.
+   */
   create: (
     props: z.input<N["schema"]>,
     options?: Readonly<{ id?: string; validFrom?: string; validTo?: string }>,
@@ -612,6 +616,8 @@ export type NodeCollection<
    * Use this for dynamic dispatch (changesets, migrations, imports) where
    * the data shape is determined at runtime, not compile time.
    * The return type is fully typed — only the input gate is relaxed.
+   *
+   * `validFrom` defaults to the operation's creation timestamp when omitted.
    */
   createFromRecord: (
     data: Record<string, unknown>,
@@ -623,6 +629,9 @@ export type NodeCollection<
    *
    * If a node with the given ID exists, updates it with the provided props.
    * Otherwise, creates a new node with that ID.
+   *
+   * `validFrom` only applies on the create branch, defaulting to the
+   * operation's creation timestamp when omitted; it has no effect on update.
    */
   upsertById: (
     id: string,
@@ -636,6 +645,9 @@ export type NodeCollection<
    * Use this for dynamic dispatch (changesets, migrations, imports) where
    * the data shape is determined at runtime, not compile time.
    * The return type is fully typed — only the input gate is relaxed.
+   *
+   * `validFrom` only applies on the create branch, defaulting to the
+   * operation's creation timestamp when omitted; it has no effect on update.
    */
   upsertByIdFromRecord: (
     id: string,
@@ -648,6 +660,8 @@ export type NodeCollection<
    *
    * More efficient than calling create() multiple times.
    * Use `bulkInsert` for the dedicated fast path that skips returning results.
+   *
+   * `validFrom` defaults to the operation's creation timestamp when omitted.
    */
   bulkCreate: (
     items: readonly Readonly<{
@@ -663,6 +677,9 @@ export type NodeCollection<
    *
    * For each item, if a node with the given ID exists, updates it.
    * Otherwise, creates a new node with that ID.
+   *
+   * `validFrom` only applies on the create branch, defaulting to the
+   * operation's creation timestamp when omitted; it has no effect on update.
    */
   bulkUpsertById: (
     items: readonly Readonly<{
@@ -679,6 +696,8 @@ export type NodeCollection<
    * This is the dedicated fast path for bulk inserts. Unlike `bulkCreate`
    * with `returnResults: false`, the intent is unambiguous: no results
    * are returned and the operation is wrapped in a transaction.
+   *
+   * `validFrom` defaults to the operation's creation timestamp when omitted.
    */
   bulkInsert: (
     items: readonly Readonly<{
@@ -847,6 +866,8 @@ export type EdgeCollection<
   /**
    * Create a new edge.
    *
+   * `validFrom` defaults to the operation's creation timestamp when omitted.
+   *
    * @param from - Source node (must be one of the allowed 'from' types)
    * @param to - Target node (must be one of the allowed 'to' types)
    * @param args - Edge properties (optional if schema is empty) and creation options
@@ -974,6 +995,8 @@ export type EdgeCollection<
    *
    * More efficient than calling create() multiple times.
    * Use `bulkInsert` for the dedicated fast path that skips returning results.
+   *
+   * `validFrom` defaults to the operation's creation timestamp when omitted.
    */
   bulkCreate: (
     items: readonly Readonly<{
@@ -991,6 +1014,9 @@ export type EdgeCollection<
    *
    * For each item, if an edge with the given ID exists, updates it.
    * Otherwise, creates a new edge with that ID.
+   *
+   * `validFrom` only applies on the create branch, defaulting to the
+   * operation's creation timestamp when omitted; it has no effect on update.
    */
   bulkUpsertById: (
     items: readonly Readonly<{
@@ -1009,6 +1035,8 @@ export type EdgeCollection<
    * This is the dedicated fast path for bulk inserts. Unlike `bulkCreate`
    * with `returnResults: false`, the intent is unambiguous: no results
    * are returned and the operation is wrapped in a transaction.
+   *
+   * `validFrom` defaults to the operation's creation timestamp when omitted.
    */
   bulkInsert: (
     items: readonly Readonly<{
