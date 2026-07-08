@@ -6,6 +6,8 @@
 import { type SQL, sql } from "drizzle-orm";
 
 import { type AggregateExpr, type FieldRef, type SelectiveField } from "../ast";
+import { parseJsonPointer } from "../json-pointer";
+import { getFieldPointer } from "./predicates";
 
 // ============================================================
 // Constants
@@ -120,6 +122,33 @@ export function markSelectiveFieldAsRequired(
     return;
   }
   addRequiredColumn(requiredColumnsByAlias, field.alias, "props");
+}
+
+function getTopLevelPropsFieldName(field: FieldRef): string | undefined {
+  const pointer = getFieldPointer(field);
+  if (pointer === undefined) return undefined;
+
+  const segments = parseJsonPointer(pointer);
+  return segments.length === 1 ? segments[0] : undefined;
+}
+
+export function findSelectivePropsFieldForFieldRef(
+  selectiveFields: readonly SelectiveField[] | undefined,
+  field: FieldRef,
+): SelectiveField | undefined {
+  if (selectiveFields === undefined || selectiveFields.length === 0) {
+    return undefined;
+  }
+
+  const propsFieldName = getTopLevelPropsFieldName(field);
+  if (propsFieldName === undefined) return undefined;
+
+  return selectiveFields.find(
+    (selectiveField) =>
+      !selectiveField.isSystemField &&
+      selectiveField.alias === field.alias &&
+      selectiveField.field === propsFieldName,
+  );
 }
 
 // ============================================================

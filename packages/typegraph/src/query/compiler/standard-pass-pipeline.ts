@@ -26,9 +26,10 @@ import { type PredicateCompilerContext } from "./predicates";
 import { assertRecordedQueryDoesNotUseCurrentIndexes } from "./recorded-current-index-guard";
 import {
   addRequiredColumn,
+  findSelectivePropsFieldForFieldRef,
   isIdFieldRef,
+  mapSelectiveSystemFieldToColumn,
   markFieldRefAsRequired,
-  markSelectiveFieldAsRequired,
   type RequiredColumnsByAlias,
 } from "./utils";
 
@@ -116,9 +117,17 @@ function collectRequiredColumnsByAlias(ast: QueryAst): RequiredColumnsByAlias {
     addRequiredColumn(requiredColumnsByAlias, traversal.nodeAlias, "id");
   }
 
-  if (ast.selectiveFields && ast.selectiveFields.length > 0) {
-    for (const field of ast.selectiveFields) {
-      markSelectiveFieldAsRequired(requiredColumnsByAlias, field);
+  const hasSelectiveFields = (ast.selectiveFields?.length ?? 0) > 0;
+
+  if (hasSelectiveFields) {
+    for (const field of ast.selectiveFields ?? []) {
+      if (field.isSystemField) {
+        addRequiredColumn(
+          requiredColumnsByAlias,
+          field.alias,
+          mapSelectiveSystemFieldToColumn(field.field),
+        );
+      }
     }
   } else {
     for (const projectedField of ast.projection.fields) {
@@ -140,6 +149,14 @@ function collectRequiredColumnsByAlias(ast: QueryAst): RequiredColumnsByAlias {
 
   if (ast.orderBy) {
     for (const orderSpec of ast.orderBy) {
+      if (
+        findSelectivePropsFieldForFieldRef(
+          ast.selectiveFields,
+          orderSpec.field,
+        ) !== undefined
+      ) {
+        continue;
+      }
       markFieldRefAsRequired(requiredColumnsByAlias, orderSpec.field);
     }
   }
@@ -148,8 +165,13 @@ function collectRequiredColumnsByAlias(ast: QueryAst): RequiredColumnsByAlias {
     markPredicateFieldsAsRequired(requiredColumnsByAlias, ast.having);
   }
 
-  for (const predicate of ast.predicates) {
-    markPredicateFieldsAsRequired(requiredColumnsByAlias, predicate.expression);
+  if (!hasSelectiveFields) {
+    for (const predicate of ast.predicates) {
+      markPredicateFieldsAsRequired(
+        requiredColumnsByAlias,
+        predicate.expression,
+      );
+    }
   }
 
   return requiredColumnsByAlias;

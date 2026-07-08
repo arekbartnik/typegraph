@@ -602,11 +602,100 @@ describe("Query Compilation to SQL", () => {
     const sqlObject = compileQuery(selectiveAst, graph.id);
     const { sql } = toSqlWithParams(sqlObject);
 
-    expect(sql).toContain("friend_props");
+    expect(sql).toContain(
+      'json_extract(n.props, \'$."name"\') AS "__tg_6:friend:4:name"',
+    );
     expect(sql).not.toContain("p_props");
     expect(sql).not.toContain("p_version");
     expect(sql).not.toContain("e_props");
+    expect(sql).not.toContain("friend_props");
     expect(sql).not.toContain("friend_version");
+  });
+
+  it("pushes selected traversal props into the traversal CTE for ordering", () => {
+    const query = createQueryBuilder<typeof graph>(graph.id, registry)
+      .from("Person", "p")
+      .traverse("knows", "e")
+      .to("Person", "friend")
+      .select((context) => ({
+        friendId: context.friend.id,
+        friendName: context.friend.name,
+      }))
+      .orderBy("friend", "name", "desc")
+      .orderBy("friend", "id", "desc")
+      .limit(10);
+
+    const ast = query.toAst();
+    const selectiveAst = {
+      ...ast,
+      selectiveFields: [
+        {
+          alias: "friend",
+          field: "id",
+          outputName: "friend_id",
+          isSystemField: true,
+        },
+        {
+          alias: "friend",
+          field: "name",
+          outputName: "friend_name",
+          isSystemField: false,
+          valueType: "string" as const,
+        },
+      ],
+    };
+    const sqlObject = compileQuery(selectiveAst, graph.id, "postgres");
+    const { sql } = toSqlWithParams(sqlObject, "postgres");
+
+    expect(sql).toContain(
+      "n.props #>> ARRAY['name'] AS \"__tg_6:friend:4:name\"",
+    );
+    expect(sql).toContain('cte_friend."__tg_6:friend:4:name" AS "friend_name"');
+    expect(sql).toContain(
+      'ORDER BY (cte_friend."__tg_6:friend:4:name" IS NULL)',
+    );
+    expect(sql).not.toContain("friend_props");
+  });
+
+  it("does not collide CTE column names for aliases/fields that are ambiguous under naive underscore-joining", () => {
+    const query = createQueryBuilder<typeof graph>(graph.id, registry)
+      .from("Person", "p_full")
+      .traverse("knows", "e")
+      .to("Person", "p")
+      .select((context) => ({
+        a: context.p_full.name,
+        b: context.p.name,
+      }));
+
+    const ast = query.toAst();
+    const selectiveAst = {
+      ...ast,
+      selectiveFields: [
+        {
+          alias: "p_full",
+          field: "name",
+          outputName: "a",
+          isSystemField: false,
+          valueType: "string" as const,
+        },
+        {
+          alias: "p",
+          field: "full_name",
+          outputName: "b",
+          isSystemField: false,
+          valueType: "string" as const,
+        },
+      ],
+    };
+    const sqlObject = compileQuery(selectiveAst, graph.id);
+    const { sql } = toSqlWithParams(sqlObject);
+
+    // Naively joining alias + "_" + field would produce the identical
+    // "__tg_p_full_name" column for both (alias="p_full", field="name") and
+    // (alias="p", field="full_name"). The length-prefixed encoding must keep
+    // them distinct so both end up as separate, unambiguous CTE columns.
+    expect(sql).toContain('AS "__tg_6:p_full:4:name"');
+    expect(sql).toContain('AS "__tg_1:p:9:full_name"');
   });
 
   it("compiles LIMIT and OFFSET", () => {
