@@ -10,6 +10,7 @@ import {
   type TransactionBackend,
 } from "../backend/types";
 import { type GraphDef } from "../core/define-graph";
+import { type RecordedInstant } from "../core/temporal";
 import {
   type AnyEdgeType,
   type EdgeId,
@@ -394,6 +395,61 @@ export type StoreOptions = LiveStoreOptions | HistoryStoreOptions;
 export interface StoreRef<T> {
   current: T;
 }
+
+// ============================================================
+// Transaction Receipt Types
+// ============================================================
+
+/**
+ * Summary returned by `store.transactionWithReceipt(fn)`.
+ */
+export type TransactionOutcome<T> = Readonly<{
+  result: T;
+  receipt: TransactionReceipt;
+}>;
+
+/**
+ * Transaction write summary.
+ *
+ * Receipt counts are completed write intents at the collection surface, not
+ * rows affected:
+ *
+ * 1. Every successful completion of a write method on `tx.nodes.*` /
+ *    `tx.edges.*` counts. The authoritative method list is
+ *    {@link NodeWrites} / {@link EdgeWrites}.
+ * 2. Bulk methods count by input length; an empty bulk call (`bulkCreate([])`)
+ *    counts 0.
+ * 3. Single-row methods count 1 on resolve — including `delete` of an absent
+ *    id and `getOrCreate*` that found an existing row. Consumers that need
+ *    "did anything actually change" semantics apply their own per-operation
+ *    policy.
+ * 4. A method that rejects counts 0 — even when the backend applied part of a
+ *    bulk input before failing. On SQLite a failed statement does not abort
+ *    the surrounding transaction, so a caller that catches the rejection and
+ *    commits can persist rows the receipt never counted. Do not read the
+ *    receipt as rows-affected in that scenario.
+ * 5. A node `delete` under `cascade` / `disconnect` removes connected edges
+ *    through the backend, not the edge-collection surface; those removals do
+ *    not appear in `edges`.
+ * 6. Rows-affected fidelity is intentionally out of scope for this first
+ *    version; a future extension could ask backends to return row counts.
+ */
+export type TransactionReceipt = Readonly<{
+  writes: Readonly<{
+    /** Completed node write intents by node kind. */
+    nodes: Readonly<Record<string, number>>;
+    /** Completed edge write intents by edge kind. */
+    edges: Readonly<Record<string, number>>;
+    /** Sum of all node and edge write intents. */
+    total: number;
+  }>;
+  /**
+   * The recorded commit instant allocated for this store's graph by this
+   * transaction. Undefined when history capture is off, the transaction is
+   * read-only, or no captured writes were flushed.
+   */
+  recorded?: RecordedInstant;
+}>;
 
 // ============================================================
 // Get-Or-Create Types

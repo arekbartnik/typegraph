@@ -1326,6 +1326,60 @@ const personId = await store.transaction(async (tx) => {
 // personId is available here
 ```
 
+#### Transaction receipts
+
+Use `store.transactionWithReceipt()` when a caller needs a write summary
+without wrapping the transaction context itself. It runs the callback exactly
+like `store.transaction()` and returns the result together with a receipt:
+
+```typescript
+const outcome = await store.transactionWithReceipt(async (tx) => {
+  const alice = await tx.nodes.Person.create({ name: "Alice" });
+  const bob = await tx.nodes.Person.create({ name: "Bob" });
+  await tx.edges.knows.getOrCreateByEndpoints(alice, bob, {
+    since: "2026",
+  });
+  return alice.id;
+});
+
+outcome.result; // Alice's id
+outcome.receipt.writes; // { nodes: { Person: 2 }, edges: { knows: 1 }, total: 3 }
+outcome.receipt.recorded; // RecordedInstant | undefined
+```
+
+Receipt counts are completed write intents at the collection surface, not rows
+affected:
+
+- Every successful completion of a write method on `tx.nodes.*` / `tx.edges.*`
+  counts. The authoritative method list is `NodeWrites` / `EdgeWrites`.
+- Bulk methods count by input length; an empty bulk call (`bulkCreate([])`)
+  counts 0.
+- Single-row methods count 1 on resolve — including `delete` of an absent id and
+  `getOrCreate*` that found an existing row. Consumers that need "did anything
+  actually change" semantics apply their own per-operation policy.
+- A method that rejects counts 0 — even when the backend applied part of a bulk
+  input before failing. On SQLite a failed statement does not abort the
+  surrounding transaction, so a caller that catches the rejection and commits
+  can persist rows the receipt never counted. Do not read the receipt as
+  rows-affected in that scenario.
+- A node `delete` under `cascade` / `disconnect` removes connected edges through
+  the backend, not the edge-collection surface; those removals do not appear in
+  `edges`.
+- Rows-affected fidelity is intentionally out of scope for this first version; a
+  future extension could ask backends to return row counts.
+
+When the store was created with `{ history: true }` and the transaction flushed
+captured writes, `receipt.recorded` is the recorded commit instant allocated for
+this store's graph by this transaction. It is `undefined` when history capture is
+off, the transaction is read-only, or no captured writes were flushed. Writes
+that bypass the transaction collection surface — direct backend writes, raw SQL,
+and import helpers — are not counted. Adopted transactions
+(`withTransaction` / `withRecordedTransaction`) do not produce receipts in this
+version because their commit belongs to the caller. On non-transactional
+backends a receipt describes operations that individually committed; if the
+callback rejects there, no receipt is returned even though earlier operations
+committed.
+
 #### Rollback and error propagation
 
 If the callback throws, the transaction is rolled back and the error re-throws to the
